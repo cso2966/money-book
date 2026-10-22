@@ -3511,6 +3511,7 @@ function isTyping() { const a = document.activeElement; return a && (a.tagName =
 document.addEventListener('focusout', () => setTimeout(() => { if (CL.pendingRender && !isTyping() && !document.querySelector('.dlg')) { CL.pendingRender = false; render(true); } }, 300));
 /* ---------- 시작 / 로그인 ---------- */
 async function cloudInit() {
+  if (/^https?:$/.test(location.protocol) && !(window.CLOUD_CONFIG && window.CLOUD_CONFIG.apiKey)) { try { await loadJs('cloud-config.js?v=' + Date.now()); } catch (e) { } } // 예전 보관본이 설정 없이 열린 경우
   CL.cfg = cloudCfg(); if (!CLOUD_OK || !CL.cfg) return;
   CL.dev = localStorage.getItem(CL_KEYS.dev) || rid(); localStorage.setItem(CL_KEYS.dev, CL.dev);
   try { const fb = await loadFirebase(); if (!fb.apps.length) fb.initializeApp(CL.cfg); CL.fb = fb; CL.db = fb.firestore();
@@ -3717,6 +3718,124 @@ function phoneTabs() {
 }
 const _renderNavC = renderNav; renderNav = function () { _renderNavC.apply(this, arguments); phoneTabs(); };
 window.addEventListener('DOMContentLoaded', () => { if (IS_MOBILE) return; phoneChrome(); if (isPhone() && (!location.hash || location.hash === '#/home') && !sessionStorage.getItem('dsd-started')) { sessionStorage.setItem('dsd-started', '1'); location.hash = '#/chat'; } });
+
+'use strict';
+/* =========================================================
+   📁 구글 드라이브 자동 백업 (하루 1번)
+   - 내 구글 드라이브의 "살돈가계부 백업" 폴더에 JSON 백업을 저장
+   - 권한: drive.file (이 앱이 만든 파일만 보고 쓸 수 있음)
+   - 마지막 백업 날짜(S.driveBk.last)는 클라우드로 공유 → 여러 기기 중 한 곳에서만 하루 1번
+   ========================================================= */
+const DRV = { tok: null, exp: 0, tc: null, busy: false, armed: false, list: null, err: '' };
+const DRV_FOLDER = '살돈가계부 백업', DRV_KEEP = 30, DRV_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const drvClient = () => (window.CLOUD_CONFIG || {}).driveClientId || '';
+const drvOK = () => CLOUD_OK && !!drvClient();
+const drvSt = () => S.driveBk || {};
+const drvOn = () => drvSt().on !== false;
+const drvToday = () => { const t = new Date(); return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}`; };
+const drvDue = () => drvOK() && drvOn() && drvSt().last !== drvToday();
+function drvSet(o) { S.driveBk = { ...drvSt(), ...o }; save(); }
+try { const t = JSON.parse(sessionStorage.getItem('dsd-drv-tok') || 'null'); if (t && t.exp > Date.now() + 60000) { DRV.tok = t.tok; DRV.exp = t.exp; } } catch (e) { }
+
+async function drvGis() {
+  if (window.google && google.accounts && google.accounts.oauth2) return;
+  await new Promise((ok, no) => { const s = document.createElement('script'); s.src = 'https://accounts.google.com/gsi/client'; s.onload = ok; s.onerror = () => no(new Error('구글 로그인 도구를 불러오지 못했습니다')); document.head.appendChild(s); });
+}
+/* 토큰 받기 — 반드시 클릭 안에서 불러야 팝업이 막히지 않음 */
+function drvToken(interactive) {
+  if (DRV.tok && DRV.exp > Date.now() + 60000) return Promise.resolve(DRV.tok);
+  return new Promise((ok, no) => {
+    if (!window.google || !google.accounts || !google.accounts.oauth2) return no(new Error('구글 로그인 도구 준비 중입니다. 잠시 후 다시 눌러 주세요'));
+    DRV.tc = google.accounts.oauth2.initTokenClient({
+      client_id: drvClient(), scope: DRV_SCOPE, hint: (CL.user && CL.user.email) || undefined,
+      callback: r => { if (r.error) return no(new Error(r.error_description || r.error)); DRV.tok = r.access_token; DRV.exp = Date.now() + (r.expires_in || 3600) * 1000;
+        try { sessionStorage.setItem('dsd-drv-tok', JSON.stringify({ tok: DRV.tok, exp: DRV.exp })); } catch (e) { } ok(DRV.tok); },
+      error_callback: e => no(new Error(e && e.type === 'popup_closed' ? '창이 닫혀서 백업을 못 했습니다' : (e && e.message) || '구글 권한을 받지 못했습니다')),
+    });
+    DRV.tc.requestAccessToken({ prompt: interactive ? '' : 'none' });
+  });
+}
+async function drvApi(path, opt = {}, base = 'https://www.googleapis.com/drive/v3/') {
+  const r = await fetch(base + path, { ...opt, headers: { Authorization: 'Bearer ' + DRV.tok, ...(opt.headers || {}) } });
+  if (r.status === 401) { DRV.tok = null; try { sessionStorage.removeItem('dsd-drv-tok'); } catch (e) { } throw new Error('구글 권한이 만료됐습니다. 다시 눌러 주세요'); }
+  if (!r.ok) throw new Error('드라이브 오류 ' + r.status + ': ' + (await r.text()).slice(0, 160));
+  return r;
+}
+async function drvFolder() {
+  const st = drvSt();
+  if (st.folder) { try { const f = await (await drvApi(`files/${st.folder}?fields=id,trashed`)).json(); if (!f.trashed) return f.id; } catch (e) { } }
+  const q = encodeURIComponent(`name='${DRV_FOLDER}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+  const l = await (await drvApi(`files?q=${q}&fields=files(id)&spaces=drive`)).json();
+  let id = l.files && l.files[0] && l.files[0].id;
+  if (!id) id = (await (await drvApi('files?fields=id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: DRV_FOLDER, mimeType: 'application/vnd.google-apps.folder' }) })).json()).id;
+  S.driveBk = { ...drvSt(), folder: id }; return id;
+}
+async function drvList(folder) {
+  const q = encodeURIComponent(`'${folder}' in parents and trashed=false`);
+  return ((await (await drvApi(`files?q=${q}&orderBy=createdTime desc&pageSize=200&fields=files(id,name,createdTime,size)`)).json()).files) || [];
+}
+async function drvBackup(interactive) {
+  if (DRV.busy) return; DRV.busy = true; DRV.err = '';
+  try {
+    await drvGis(); await drvToken(interactive);
+    const folder = await drvFolder();
+    const name = `살돈가계부_백업_${stamp()}.json`, body = JSON.stringify(S);
+    const bd = 'dsd' + Date.now().toString(36);
+    const multipart = `--${bd}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name, parents: [folder], mimeType: 'application/json' })}\r\n--${bd}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${body}\r\n--${bd}--`;
+    await drvApi('files?uploadType=multipart&fields=id', { method: 'POST', headers: { 'Content-Type': 'multipart/related; boundary=' + bd }, body: multipart }, 'https://www.googleapis.com/upload/drive/v3/');
+    // 오래된 백업은 휴지통으로 (30개만 남김)
+    const all = await drvList(folder); DRV.list = all;
+    for (const f of all.slice(DRV_KEEP)) { try { await drvApi(`files/${f.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: true }) }); } catch (e) { } }
+    if (all.length > DRV_KEEP) DRV.list = all.slice(0, DRV_KEEP);
+    drvSet({ last: drvToday(), lastAt: Date.now(), lastName: name, err: '' });
+    toast('📁 구글 드라이브에 백업했습니다');
+  } catch (e) { DRV.err = e.message; if (interactive) toast('드라이브 백업 실패: ' + e.message); }
+  finally { DRV.busy = false; if (ROUTE.name === 'cloud') render(true); }
+}
+/* 하루 1번 자동: 토큰이 살아 있으면 바로, 아니면 다음 클릭 때 조용히 권한 받고 백업 (PC에서만) */
+function drvAuto() {
+  if (!drvDue() || !CL.ready || (typeof isPhone === 'function' && isPhone())) return;
+  if (DRV.tok && DRV.exp > Date.now() + 60000) { drvBackup(false); return; }
+  if (DRV.armed) return; DRV.armed = true; drvGis().catch(() => { });
+  const once = ev => {
+    if (!drvDue()) { document.removeEventListener('click', once, true); DRV.armed = false; return; }
+    if (!window.google || !google.accounts || !google.accounts.oauth2) return; // 아직 준비 안 됨 → 다음 클릭
+    if (ev.target && ev.target.closest && ev.target.closest('input,textarea,select,[contenteditable]')) return;
+    document.removeEventListener('click', once, true); DRV.armed = false; drvBackup(true);
+  };
+  document.addEventListener('click', once, true);
+}
+setInterval(drvAuto, 10 * 60 * 1000);
+{ const _go = cloudGo; cloudGo = function () { _go.apply(this, arguments); setTimeout(drvAuto, 4000); }; }
+
+ACTIONS.drvNow = () => drvBackup(true);
+ACTIONS.drvToggle = () => { drvSet({ on: !drvOn() }); render(true); toast(drvOn() ? '드라이브 자동 백업을 켰습니다' : '드라이브 자동 백업을 껐습니다'); };
+ACTIONS.drvList = async () => {
+  try { await drvGis(); await drvToken(true); DRV.list = await drvList(await drvFolder()); render(true); }
+  catch (e) { toast('목록을 못 불러왔습니다: ' + e.message); }
+};
+ACTIONS.drvRestore = async el => {
+  const id = el.dataset.id, nm = el.dataset.name || '';
+  if (!confirm(`이 백업으로 되돌릴까요?\n${nm}\n\n지금 가계부 내용이 백업 내용으로 바뀌고, 휴대폰 등 다른 기기에도 그대로 반영됩니다.`)) return;
+  try { await drvGis(); await drvToken(true); const o = await (await drvApi(`files/${id}?alt=media`)).json();
+    if (!o || !o.settings || !o.months) throw new Error('가계부 백업 파일이 아닙니다');
+    const keep = drvSt(); S = migrate(o); S.driveBk = keep; save(); render(); toast('드라이브 백업으로 되돌렸습니다'); }
+  catch (e) { alert('복원 실패: ' + e.message); }
+};
+function drvCard() {
+  if (!CLOUD_OK) return '';
+  if (!drvClient()) return `<div class="card mb"><h3>📁 구글 드라이브 자동 백업</h3><div class="small muted">cloud-config.js 에 driveClientId 가 없어 꺼져 있습니다.</div></div>`;
+  const st = drvSt(), on = drvOn();
+  const last = st.lastAt ? new Date(st.lastAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '아직 없음';
+  const list = DRV.list ? `<div class="tw" style="max-height:260px;overflow:auto;margin-top:10px"><table class="t"><thead><tr><th>백업 파일</th><th>날짜</th><th></th></tr></thead><tbody>${DRV.list.map(f => `<tr><td class="small">${esc(f.name)}</td><td class="small">${new Date(f.createdTime).toLocaleString('ko-KR')}</td><td><button class="btn sm" data-act="drvRestore" data-id="${esc(f.id)}" data-name="${esc(f.name)}">이걸로 복원</button></td></tr>`).join('') || '<tr><td colspan="3" class="small muted">백업이 없습니다</td></tr>'}</tbody></table></div>` : '';
+  return `<div class="card mb"><h3>📁 구글 드라이브 자동 백업 <span class="r">${on ? '<span class="pill g">하루 1번 자동</span>' : '<span class="pill">꺼짐</span>'}</span></h3>
+    <div class="small" style="line-height:1.8">내 구글 드라이브 <b>「${DRV_FOLDER}」</b> 폴더에 가계부 전체를 매일 한 번 저장합니다 (최근 ${DRV_KEEP}개 보관).<br>
+    마지막 백업: <b>${esc(last)}</b>${st.last === drvToday() ? ' <span class="pill g">오늘 완료</span>' : on && CL.user ? ' <span class="muted">· 오늘 백업 대기 중 (PC에서 화면을 한 번 클릭하면 진행)</span>' : ''}
+    ${DRV.err ? `<br><span style="color:#c0564b">⚠️ ${esc(DRV.err)}</span>` : ''}</div>
+    <div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap"><button class="btn sm p" data-act="drvNow" ${DRV.busy ? 'disabled' : ''}>${DRV.busy ? '백업 중…' : '지금 백업'}</button><button class="btn sm" data-act="drvList">백업 목록 · 복원</button><button class="btn sm" data-act="drvToggle">${on ? '자동 백업 끄기' : '자동 백업 켜기'}</button></div>
+    <div class="small muted" style="margin-top:8px">처음 한 번 구글 권한 창이 뜹니다. 이 앱은 자기가 만든 백업 파일만 볼 수 있고, 드라이브의 다른 파일은 볼 수 없습니다.</div>${list}</div>`;
+}
+{ const _r = PAGES.cloud.render; PAGES.cloud.render = function () { const h = _r.apply(this, arguments); return CL.user ? h.replace('<div class="grid g2 mb">', drvCard() + '<div class="grid g2 mb">') : h; }; }
 
 'use strict';
 /* ---------- boot ---------- */
