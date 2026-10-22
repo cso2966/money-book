@@ -3478,7 +3478,7 @@ function applyRemote(id, d) {
   if (id === 'main') {
     if (d.dev === CL.dev && d.rev <= (CL.mainRev || 0)) return false;
     const localDirty = JSON.stringify(mainObj()) !== CL.base.main;
-    if (localDirty && CL.mainDirtyAt && d.rev < CL.mainDirtyAt) return false; // 내 수정이 더 최신 → 곧 올라감
+    if (localDirty && (CL.mainDirtyAt ? d.rev < CL.mainDirtyAt : CL.base.main == null)) return false; // 내 수정이 더 최신이거나, 이 기기 데이터로 올리는 중 → 곧 올라감
     const keepLocal = { broker: S.broker && { ...S.broker } }; // 도우미 연결 코드 등 PC 전용 값은 유지
     Object.keys(d.data || {}).forEach(k => { S[k] = d.data[k]; });
     if (keepLocal.broker && S.broker) { S.broker.token = keepLocal.broker.token || S.broker.token; S.broker.url = keepLocal.broker.url || S.broker.url; }
@@ -3556,10 +3556,10 @@ function cloudAsk(docs) {
     <button class="btn" id="ca3">🔀 둘 다 합치기 <span class="small">(같은 기록은 하나로)</span></button>
     <button class="btn danger" id="ca2">💻 이 기기 데이터로 클라우드 덮어쓰기</button></div>`);
   d.querySelector('#ca1').onclick = () => { d.remove(); cloudUseRemote(docs); cloudGo(); toast('클라우드 데이터를 불러왔습니다'); };
-  d.querySelector('#ca2').onclick = () => { if (!confirm('클라우드의 기존 데이터를 이 기기 데이터로 바꿀까요?')) return; d.remove(); CL.base = { main: null }; for (let n = 1; n <= 12; n++) { const dd = docs['m' + n]; if (dd) CL.base['m' + n] = { recs: Object.fromEntries((dd.records || []).map(r => [r.id, recJ(r)])), meta: '' }; } cloudGo(); toast('이 기기 데이터를 클라우드에 올립니다'); };
+  d.querySelector('#ca2').onclick = () => { if (!confirm('클라우드의 기존 데이터를 이 기기 데이터로 바꿀까요?')) return; d.remove(); CL.base = { main: null }; CL.mainDirtyAt = Date.now(); for (let n = 1; n <= 12; n++) { const dd = docs['m' + n]; if (dd) CL.base['m' + n] = { recs: Object.fromEntries((dd.records || []).map(r => [r.id, recJ(r)])), meta: '' }; } cloudGo(); toast('이 기기 데이터를 클라우드에 올립니다'); };
   d.querySelector('#ca3').onclick = () => { d.remove(); const keys = new Set(allRecs().map(r => [r.date, nz(r.memo), num(r.amt)].join('|')));
     for (let n = 1; n <= 12; n++) { const dd = docs['m' + n]; if (!dd) continue; (dd.records || []).forEach(r => { const k = [r.date, nz(r.memo), num(r.amt)].join('|'); if (!keys.has(k) && !recs(n).some(x => x.id === r.id)) { recs(n).push(r); keys.add(k); } else if (!recs(n).some(x => x.id === r.id)) { (CL.del['m' + n] = CL.del['m' + n] || {})[r.id] = Date.now(); } }); }
-    CL.base = { main: null }; cloudGo(); toast('두 데이터를 합쳤습니다'); };
+    CL.base = { main: null }; CL.mainDirtyAt = Date.now(); cloudGo(); toast('두 데이터를 합쳤습니다'); };
 }
 /* ---------- 표시 ---------- */
 function cloudBadge() {
